@@ -1,14 +1,24 @@
 import assert from "node:assert";
-import Anthropic from "@anthropic-ai/sdk";
+import { OpenAI } from "openai";
 import pc from "picocolors";
 import { apiKey, maxTokens, model, prompt } from "./config";
 import { log } from "./log";
 import { spinner } from "./spinner";
 import { executeTool, tools } from "./tools";
 
-const client = new Anthropic({
-  apiKey,
-});
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
+const OPENROUTER_BASE_URL =
+  process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1"
+
+const openai = new OpenAI({
+  apiKey: OPENROUTER_API_KEY, // defaults to process.env["OPENAI_API_KEY"]
+  baseURL: OPENROUTER_BASE_URL,
+  defaultHeaders: {
+    "HTTP-Referer": "https://github.com/lguzzon-scratchbook/makeitpass",
+  },
+  // dangerouslyAllowBrowser: true, // Enable this if you used OAuth to fetch a user-scoped `apiKey` above. See https://openrouter.ai/docs#oauth to learn how.
+})
+const client = openai
 
 function composePrompt(opts: { command: string; stdout: string; error: string }): string {
   return `
@@ -24,14 +34,14 @@ ${opts.error}
 ${prompt}`;
 }
 
-const messageHistory: Anthropic.MessageParam[] = [];
+const messageHistory: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
 export async function applyFix(opts: {
   command: string;
   stdout: string;
   error: string;
   iteration: number;
-}): Promise<Anthropic.Messages.Message> {
+}): Promise<OpenAI.Chat.ChatCompletion.Choice> {
   try {
     const prompt = composePrompt(opts);
     messageHistory.push({
@@ -40,56 +50,56 @@ export async function applyFix(opts: {
     });
 
     while (true) {
-      log("asking claude...", 2);
+      log("asking GPT...", 2);
       let response = await spinner(
-        "Claude is thinking",
-        client.messages.create({
+        "GPT is thinking",
+        client.chat.completions.create({
           model,
           max_tokens: maxTokens,
           messages: messageHistory,
           tools,
         }),
       );
-      messageHistory.push({ role: "assistant", content: response.content });
-      assert(response.stop_reason === "tool_use", "expected tool_use response");
+      
+      const assistantMessage = response.choices[0].message;
+      messageHistory.push(assistantMessage);
+      
+      assert(assistantMessage.tool_calls, "expected tool calls in response");
 
-      const textMessage = response.content.find(
-        (content): content is Anthropic.TextBlock => content.type === "text",
-      );
-      if (textMessage) {
-        console.log(pc.cyan(`${pc.yellow(`Iteration ${opts.iteration}`)}: 🤖 ${textMessage.text}`));
+      const textContent = assistantMessage.content;
+      if (textContent) {
+        console.log(pc.cyan(`${pc.yellow(`Iteration ${opts.iteration}`)}: 🤖 ${textContent}`));
       }
-      const toolBlocks = response.content.filter(
-        (content): content is Anthropic.ToolUseBlock => content.type === "tool_use",
-      );
-      assert(toolBlocks.length > 0, `no tool found in response: ${JSON.stringify(response)}`);
+      
+      const toolCalls = assistantMessage.tool_calls;
+      assert(toolCalls.length > 0, `no tool found in response: ${JSON.stringify(response)}`);
 
       // run tools in parallel
-      const content = await spinner(
+      const toolResults = await spinner(
         "Running tools",
         Promise.all(
-          toolBlocks.map(async (toolBlock) => {
-            log(`claude is using tool: ${toolBlock.name}`, 2);
+          toolCalls.map(async (toolCall) => {
+            log(`GPT is using tool: ${toolCall.function.name}`, 2);
             const toolResult = await executeTool({
-              name: toolBlock.name,
-              input: toolBlock.input,
+              name: toolCall.function.name,
+              input: JSON.parse(toolCall.function.arguments),
               iteration: opts.iteration,
             });
             assert(typeof toolResult === "string", `tool result should be string: ${toolResult}`);
             log(`tool result: ${toolResult}`, 2);
             return {
-              type: "tool_result",
-              tool_use_id: toolBlock.id,
-              content: [{ type: "text", text: toolResult }],
-            } satisfies Anthropic.ToolResultBlockParam;
+              tool_call_id: toolCall.id,
+              role: "tool" as const,
+              content: toolResult,
+            };
           }),
         ),
       );
-      messageHistory.push({ role: "user", content: content });
+      messageHistory.push(...toolResults);
 
       response = await spinner(
-        "Claude is thinking",
-        client.messages.create({
+        "GPT is thinking",
+        client.chat.completions.create({
           model,
           max_tokens: maxTokens,
           messages: messageHistory,
@@ -98,8 +108,8 @@ export async function applyFix(opts: {
       );
 
       // keep looping until decides not to use tools anymore
-      if (response.stop_reason === "tool_use") continue;
-      return response;
+      if (response.choices[0].message.tool_calls) continue;
+      return response.choices[0];
     }
   } catch (error) {
     console.dir(messageHistory, { depth: null });
